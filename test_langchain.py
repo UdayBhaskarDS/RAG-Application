@@ -18,7 +18,9 @@ from langchain.chains import create_history_aware_retriever, create_retrieval_ch
 from langchain.chains.combine_documents import create_stuff_documents_chain
 
 dotenv.load_dotenv()
+import os
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Load docs
 
@@ -57,3 +59,74 @@ try:
 
 except Exception as e:
     print(f"Error loading document from {url}: {e}")
+
+
+# Split docs
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=5000,
+    chunk_overlap=1000,
+)
+
+document_chunks = text_splitter.split_documents(docs)
+
+# Tokenize and load the documents to the vector store
+
+vector_db = Chroma.from_documents(
+    documents=document_chunks,
+    embedding=OpenAIEmbeddings(),
+)
+
+# Retrieve
+
+def _get_context_retriever_chain(vector_db, llm):
+    retriever = vector_db.as_retriever()
+    prompt = ChatPromptTemplate.from_messages([
+        MessagesPlaceholder(variable_name="messages"),
+        ("user", "{input}"),
+        ("user", "Given the above conversation, generate a search query to look up in order to get inforamtion relevant to the conversation, focusing on the most recent messages."),
+    ])
+    retriever_chain = create_history_aware_retriever(llm, retriever, prompt)
+
+    return retriever_chain
+
+
+def get_conversational_rag_chain(llm):
+    retriever_chain = _get_context_retriever_chain(vector_db, llm)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+        """You are a helpful assistant. You will have to answer to user's queries.
+        You will have some context to help with your answers, but now always would be completely related or helpful.
+        You can also use your knowledge to assist answering the user's queries.\n
+        {context}"""),
+        MessagesPlaceholder(variable_name="messages"),
+        ("user", "{input}"),
+    ])
+    stuff_documents_chain = create_stuff_documents_chain(llm, prompt)
+
+    return create_retrieval_chain(retriever_chain, stuff_documents_chain)
+
+
+llm_stream_openai = ChatOpenAI(
+    model="gpt-4o",  # Here you could use "o1-preview" or "o1-mini" if you already have access to them
+    temperature=0.3,
+    streaming=True,
+)
+
+llm_stream = llm_stream_openai  # Select between OpenAI and Anthropic models for the response
+
+messages = [
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": "Hi there! How can I assist you today?"},
+    {"role": "user", "content": "What is the latest version of Streamlit?"},
+]
+messages = [HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]) for m in messages]
+
+conversation_rag_chain = get_conversational_rag_chain(llm_stream)
+response_message = "*(RAG Response)*\n"
+for chunk in conversation_rag_chain.pick("answer").stream({"messages": messages[:-1], "input": messages[-1].content}):
+    response_message += chunk
+    print(chunk, end="", flush=True)
+
+messages.append({"role": "assistant", "content": response_message})
